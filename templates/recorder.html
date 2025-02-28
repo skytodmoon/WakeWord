@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>小智唤醒词数据收集</title>
+    <script>
+        let recorder;
+        let audioChunks = [];
+
+        async function startRecording(type) {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+                sampleRate: 16000,
+                channelCount: 1,
+                sampleSize: 16
+            }});
+            const options = {
+                mimeType: 'audio/webm;codecs=opus', // 明确指定编码格式
+                audioBitsPerSecond: 16000
+            };
+            recorder = new MediaRecorder(stream, options);
+            recorder.ondataavailable = e => audioChunks.push(e.data);
+
+            recorder.start(500); // 每500ms收集一次数据
+            document.getElementById('status').textContent = '录音中...';
+        }
+
+        async function stopAndUpload(type) {
+            recorder.stop();
+            const blob = new Blob(audioChunks, { type: 'audio/wav' });
+            const formData = new FormData();
+
+            formData.append('audio', blob, 'recording.wav');
+            formData.append('type', type);
+            formData.append('user_id', document.getElementById('user_id').value);
+
+            const response = await fetch('/upload', {
+                method: 'POST',
+                body: formData
+            });
+
+            const result = await response.json();
+            console.log('Upload result:', result);
+            audioChunks = [];
+        }
+    </script>
+</head>
+<body>
+    <h1>录制"小智"唤醒词</h1>
+    <div>
+        <label>用户ID: <input type="text" id="user_id" value="user_001"></label>
+    </div>
+    <div>
+        <button onclick="startRecording('positive')">开始录制正样本</button>
+        <button onclick="stopAndUpload('positive')">停止并上传</button>
+    </div>
+    <div>
+        <button onclick="startRecording('negative')">开始录制负样本</button>
+        <button onclick="stopAndUpload('negative')">停止并上传</button>
+    </div>
+    <div id="status"></div>
+</body>
+</html>

@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>小智唤醒词检测系统</title>
+
+    <!-- 本地依赖 -->
+    <script src="/js/tfjs/tf.min.js"></script>
+    <script src="/js/tfjs/tf-backend-wasm.js"></script>
+    <script src="/js/vad-web/bundle.min.js"></script>
+
+
+    <style>
+        /* 优化后的样式 */
+        body { font-family: '微软雅黑', sans-serif; max-width: 800px; margin: 2rem auto; padding: 20px; }
+        #status { padding: 15px; border-radius: 8px; margin: 1rem 0; transition: all 0.3s; }
+        .ready { background: #4CAF50; color: white; }
+        .processing { background: #FF9800; color: white; }
+        .activated { background: #2196F3; color: white; animation: pulse 1.5s infinite; }
+        button { padding: 12px 24px; font-size: 16px; cursor: pointer; border: none; border-radius: 25px;
+                 background: #4CAF50; color: white; transition: all 0.3s; }
+        button:hover { transform: scale(1.05); box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.6; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <h1>小智唤醒词检测系统</h1>
+    <button id="controlBtn">启动检测</button>
+    <div id="status" class="ready">状态：准备就绪</div>
+    <div id="results"></div>
+
+    <script>
+class WakeWordEngine {
+    constructor() {
+        // 系统配置
+        this.vad = null;
+        this.model = null;
+        this.isRunning = false;
+        this.requiredFrames = 30;  // 输入特征时间维度
+        this.melBins = 31;         // 梅尔频带数
+
+        // 音频参数
+        this.sampleRate = 16000;   // VAD输出采样率
+        this.frameLength = 0.025;  // 25ms帧长
+        this.frameStep = 0.01;     // 10ms帧移
+
+        // 初始化控件
+        document.getElementById('controlBtn').onclick = () => this.toggle();
+        // 绑定方法上下文
+        this.updateStatus = this.updateStatus.bind(this);
+        this.handleError = this.handleError.bind(this);
+        // 在构造函数中注册环境标志
+        this.registerWASMFlags();
+    }
+
+    registerWASMFlags() {
+        // 注册WASM相关环境标志
+        const flags = {
+            'WASM_PATH': {
+                defaultValue: '/js/tfjs/wasm/',
+                environmentVariable: 'TFJS_WASM_PATH'
+            },
+            'WASM_HAS_SIMD_SUPPORT': {
+                defaultValue: false,
+                environmentVariable: 'TFJS_WASM_SIMD'
+            }
+        };
+
+        Object.entries(flags).forEach(([key, config]) => {
+            if (!tf.env().getFlags().hasOwnProperty(key)) {
+                tf.env().registerFlag(key, config);
+            }
+        });
+    }
+    async initialize() {
+        try {
+            await this.initTF();
+            // 并行初始化组件
+            await Promise.all([
+                // 确保先加载WASM
+                this.initVAD(),
+                this.loadKerasModel()
+            ]);
+            this.updateStatus('系统就绪', 'ready');
+        } catch (error) {
+            this.handleError('初始化失败', error);
+        }
+    }
+
+    async initVAD() {
+
+        // 配置VAD参数
+        this.vad = await vad.MicVAD.new({
+            modelURL: '/js/vad-web/silero_vad.onnx',
+            workletURL: '/js/vad-web/vad.worklet.js',
+            wasmPath: '/js/vad-web/',
+            onSpeechStart: () => this.onSpeechStart(),
+            onSpeechEnd: (audio) => this.onSpeechEnd(audio),
+            minSpeechFrames: 8,
+            positiveSpeechThreshold: 0.85
+        });
+    }
+    async initTF() {
+        try {
+            // 1. 动态加载WASM后端（带重试机制）
+            await this.loadWASMBackendWithRetry(3);
+
+            // 2. 验证后端类存在性
+            if (typeof tf.wasm.WasmBackend === 'undefined') {
+                throw new Error('WASM后端类未正确加载');
+            }
+
+            // 3. 单次注册保障
+            if (!tf.engine().registry['wasm']) {
+                await tf.registerBackend('wasm', () => new tf.wasm.WasmBackend());
+            }
+
+            // 4. 激活后端
+            await tf.setBackend('wasm');
+            await tf.ready();
+
+            console.log('WASM初始化状态:', {
+                backend: tf.getBackend(),
+                simd: tf.env().get('WASM_HAS_SIMD_SUPPORT')
+            });
+        } catch (error) {
+            throw new Error(`TF初始化失败: ${error.message}`);
+        }
+    }
+
+    async loadWASMBackendWithRetry(retries = 3) {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                if (typeof tf.wasm !== 'undefined') return;
+
+                await new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = `/js/tfjs/tf-backend-wasm.js?attempt=${attempt}`;
+                    script.onload = resolve;
+                    script.onerror = () => reject(new Error(`第${attempt}次加载失败`));
+                    document.head.appendChild(script);
+                });
+                return;
+            } catch (error) {
+                if (attempt === retries) throw error;
+                await new Promise(r => setTimeout(r, 500 * attempt));
+            }
+        }
+    }
+
+    async loadKerasModel() {
+        // 加载转换后的Keras模型
+        this.model = await tf.loadLayersModel('/models/xiaozhi/model.json', {
+            weightPathPrefix: '/models/xiaozhi/',
+            onProgress: (p) => console.log(`模型加载进度: ${(p*100).toFixed(1)}%`)
+        });
+
+        // 预热模型
+        const dummyInput = tf.zeros([1, this.requiredFrames, this.melBins, 1]);
+        this.model.predict(dummyInput).dispose();
+    }
+
+    async processAudio(rawAudio) {
+        return tf.tidy(() => {
+            // 1. 转换为Tensor并标准化
+            const audioTensor = tf.tensor1d(rawAudio);
+            const normalized = tf.sub(tf.div(audioTensor, 32768.0), 0.5);
+
+            // 2. 生成梅尔频谱图
+            const spectrogram = this.computeMelSpectrogram(normalized);
+
+            // 3. 调整形状匹配模型输入 [batch, 30, 31, 1]
+            return spectrogram.reshape([1, this.requiredFrames, this.melBins, 1]);
+        });
+    }
+
+    computeMelSpectrogram(audioTensor) {
+        // 实现特征提取流程（示例需要替换为实际预处理）
+        // 这里展示与模型输入匹配的逻辑
+        const frameSize = this.frameLength * this.sampleRate;  // 400 samples
+        const frameStep = this.frameStep * this.sampleRate;    // 160 samples
+
+        // 分帧处理
+        const frames = tf.signal.frame(
+            audioTensor,
+            frameSize,
+            frameStep
+        );
+
+        // 加窗处理（汉明窗）
+        const window = tf.signal.hammingWindow(frameSize);
+        const windowed = tf.mul(frames, window);
+
+        // FFT变换
+        const fft = tf.signal.rfft(windowed);
+        const magnitude = tf.abs(fft);
+
+        // 梅尔滤波器组（需要与训练时相同的参数）
+        const melFilterbank = tf.linspace(0, 1, this.melBins).reshape([-1, 1]);
+        const melSpectrum = tf.matMul(melFilterbank, magnitude);
+
+        // 对数压缩
+        return tf.log(tf.add(melSpectrum, 1e-6));
+    }
+
+    async onSpeechEnd(rawAudio) {
+        try {
+            this.updateStatus('分析中...', 'processing');
+
+            // 执行音频处理
+            const inputTensor = await this.processAudio(rawAudio);
+
+            // 模型推理
+            const prediction = this.model.predict(inputTensor);
+            const score = (await prediction.data())[0];
+            inputTensor.dispose();
+            prediction.dispose();
+
+            // 结果处理
+            if (score > 0.95) {
+                this.onActivation();
+            } else {
+                this.updateStatus('未检测到唤醒词', 'ready');
+            }
+        } catch (error) {
+            this.handleError('分析失败', error);
+        }
+    }
+
+    onActivation() {
+        this.updateStatus('唤醒成功!', 'activated');
+        this.playFeedbackTone();
+        this.logResult('✅ 检测到唤醒词「小智」');
+
+        // 3秒后恢复监听
+        setTimeout(() => this.updateStatus('恢复监听', 'ready'), 3000);
+    }
+
+    // 辅助方法
+    updateStatus(text, state) {
+        const statusDiv = document.getElementById('status');
+        statusDiv.textContent = `状态：${text}`;
+        statusDiv.className = state;
+    }
+
+    logResult(text) {
+        const resultsDiv = document.getElementById('results');
+        resultsDiv.innerHTML = `<p>${new Date().toLocaleTimeString()}: ${text}</p>${resultsDiv.innerHTML}`;
+    }
+
+    playFeedbackTone() {
+        const ctx = new AudioContext();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        osc.type = 'sine';
+        osc.frequency.value = 1000;
+        gain.gain.value = 0.3;
+
+        osc.start();
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+        osc.stop(ctx.currentTime + 0.5);
+    }
+
+    handleError(context, error) {
+        console.error('完整错误上下文:', {error,asmBackendExists: !!tf?.wasm?.WasmBackend});
+        this.updateStatus(`${error.message}`, 'error');
+        this.stop();
+    }
+
+    toggle() {
+        this.isRunning ? this.stop() : this.start();
+    }
+
+    async start() {
+        try {
+            await this.vad.start();
+            this.isRunning = true;
+            document.getElementById('controlBtn').textContent = '停止检测';
+            this.updateStatus('检测中...', 'ready');
+        } catch (error) {
+            this.handleError('启动失败', error);
+        }
+    }
+
+    // 修改后的stop方法
+    stop() {
+        if (this.vad) {
+            try {
+                this.vad.destroy();
+            } catch (e) {
+                console.warn('VAD销毁异常:', e);
+            }
+        }
+        this.isRunning = false;
+        this.updateStatus('已停止', 'inactive');
+    }
+
+}
+
+// 初始化系统
+const engine = new WakeWordEngine();
+engine.initialize().catch(err => engine.handleError('启动异常', err));
+    </script>
+</body>
+</html>

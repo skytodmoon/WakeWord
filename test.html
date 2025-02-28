@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>小智唤醒词测试</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 20px;
+            transition: background-color 0.3s;
+        }
+        #status {
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            background: #f0f0f0;
+        }
+        .detected {
+            background-color: #d4edda !important;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: opacity 0.3s;
+        }
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        #confidence {
+            margin-top: 20px;
+            height: 20px;
+            background: #e9ecef;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        #confidence-bar {
+            width: 0%;
+            height: 100%;
+            background: #28a745;
+            transition: width 0.3s;
+        }
+    </style>
+</head>
+<body>
+    <h1>小智唤醒词实时检测</h1>
+    <button id="startBtn">开始检测</button>
+    <div id="status">状态：等待开始</div>
+    <div id="confidence">
+        <div id="confidence-bar"></div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.18.0/dist/tf.min.js"></script>
+    <script>
+        class WakeWordDetector {
+            constructor() {
+                this.model = null;
+                this.audioContext = null;
+                this.scriptProcessor = null;
+                this.isListening = false;
+                this.bufferSize = 512; // 与训练时的帧长一致
+                this.sampleRate = 16000;
+                this.contextFrames = 15; // 上下文窗口
+                this.detectionThreshold = 0.93;
+            }
+
+            async init() {
+                try {
+                    // 加载模型
+                    this.model = await tf.loadGraphModel('static/web_model/model.json');
+                    console.log('模型加载成功');
+
+                    // 初始化音频环境
+                    await this.setupAudio();
+                    return true;
+                } catch (error) {
+                    console.error('初始化失败:', error);
+                    return false;
+                }
+            }
+
+            async setupAudio() {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: this.sampleRate,
+                        channelCount: 1,
+                        echoCancellation: false,
+                        noiseSuppression: false
+                    }
+                });
+
+                this.audioContext = new AudioContext({ sampleRate: this.sampleRate });
+                const source = this.audioContext.createMediaStreamSource(stream);
+
+                // 创建音频处理节点
+                this.scriptProcessor = this.audioContext.createScriptProcessor(
+                    this.bufferSize, 1, 1
+                );
+
+                source.connect(this.scriptProcessor);
+                this.scriptProcessor.connect(this.audioContext.destination);
+            }
+
+            start() {
+                if (!this.model) {
+                    alert('请先初始化模型');
+                    return;
+                }
+
+                this.isListening = true;
+                this.audioBuffer = [];
+                this.scriptProcessor.onaudioprocess = (event) => {
+                    if (!this.isListening) return;
+
+                    const audioData = event.inputBuffer.getChannelData(0);
+                    this.processAudio(audioData);
+                };
+            }
+
+            stop() {
+                this.isListening = false;
+                this.scriptProcessor.onaudioprocess = null;
+            }
+
+            processAudio(data) {
+                // 缓存最近的音频帧
+                this.audioBuffer.push(...data);
+                if (this.audioBuffer.length > this.bufferSize * (2 * this.contextFrames + 1)) {
+                    this.audioBuffer = this.audioBuffer.slice(-this.bufferSize * (2 * this.contextFrames + 1));
+                }
+
+                // 每半秒处理一次
+                if (this.audioBuffer.length >= this.bufferSize * 30) {
+                    const features = this.extractFeatures(this.audioBuffer);
+                    this.predict(features);
+                    this.audioBuffer = [];
+                }
+            }
+
+            extractFeatures(audioData) {
+                // 预处理（与训练时一致）
+                const preEmphasized = this.preEmphasis(audioData);
+                const frames = this.frameSignal(preEmphasized);
+                const windowed = this.applyWindow(frames);
+                const spectrogram = this.computeSpectrogram(windowed);
+                const mfcc = this.computeMFCC(spectrogram);
+                return this.addContext(mfcc);
+            }
+
+            preEmphasis(signal, coeff=0.97) {
+                const out = new Float32Array(signal.length);
+                out[0] = signal[0];
+                for (let i = 1; i < signal.length; i++) {
+                    out[i] = signal[i] - coeff * signal[i-1];
+                }
+                return out;
+            }
+
+            frameSignal(signal, frameLength=512, hopLength=160) {
+                const numFrames = Math.ceil((signal.length - frameLength) / hopLength) + 1;
+                const frames = [];
+
+                for (let i = 0; i < numFrames; i++) {
+                    const start = i * hopLength;
+                    const end = start + frameLength;
+                    frames.push(signal.slice(start, end));
+                }
+                return frames;
+            }
+
+            applyWindow(frames) {
+                const window = tf.signal.hannWindow(frames[0].length);
+                return frames.map(frame => {
+                    const frameTensor = tf.tensor1d(frame);
+                    return frameTensor.mul(window).arraySync();
+                });
+            }
+
+            computeSpectrogram(frames) {
+                return frames.map(frame => {
+                    const real = new Float32Array(frame);
+                    const imag = new Float32Array(frame.length).fill(0);
+                    const fft = new FFT(frame.length, this.sampleRate);
+                    fft.forward(real, imag);
+                    return Array.from(real).slice(0, frame.length/2);
+                });
+            }
+
+            computeMFCC(spectrogram) {
+                // 简化的MFCC计算（实际应使用与训练一致的参数）
+                return spectrogram.map(frame => {
+                    const energies = frame.map(x => Math.log(x ** 2 + 1e-6));
+                    return tf.tensor(energies).reshape([30, 1]).arraySync();
+                });
+            }
+
+            addContext(features, context=15) {
+                const padded = tf.pad(features, [[context, context], [0, 0]]);
+                const output = [];
+                for (let i = context; i < padded.shape[0] - context; i++) {
+                    const window = padded.slice([i-context, 0], [2*context+1, 1]);
+                    output.push(window.flatten().arraySync());
+                }
+                return tf.tensor(output);
+            }
+
+            async predict(features) {
+                const inputTensor = tf.tensor(features).reshape([
+                    -1, 30, 31, 1  // 与模型输入形状匹配
+                ]);
+
+                const prediction = await this.model.predict(inputTensor).data();
+                const confidence = prediction[0];
+
+                this.updateUI(confidence);
+                inputTensor.dispose();
+            }
+
+            updateUI(confidence) {
+                const statusElem = document.getElementById('status');
+                const barElem = document.getElementById('confidence-bar');
+
+                barElem.style.width = `${Math.round(confidence * 100)}%`;
+
+                if (confidence > this.detectionThreshold) {
+                    statusElem.textContent = `检测到唤醒词！置信度：${confidence.toFixed(3)}`;
+                    document.body.classList.add('detected');
+
+                    // 触发唤醒动作
+                    this.onWakeWordDetected();
+                } else {
+                    statusElem.textContent = `置信度：${confidence.toFixed(3)}`;
+                    document.body.classList.remove('detected');
+                }
+            }
+
+            onWakeWordDetected() {
+                // 在此处添加唤醒后的处理逻辑
+                console.log('唤醒词触发！');
+            }
+        }
+
+        // 初始化检测器
+        const detector = new WakeWordDetector();
+        let isRunning = false;
+
+        document.getElementById('startBtn').addEventListener('click', async () => {
+            const button = document.getElementById('startBtn');
+
+            if (!isRunning) {
+                button.disabled = true;
+                button.textContent = '初始化中...';
+
+                const success = await detector.init();
+                if (success) {
+                    button.textContent = '停止检测';
+                    button.disabled = false;
+                    detector.start();
+                    isRunning = true;
+                }
+            } else {
+                detector.stop();
+                button.textContent = '开始检测';
+                isRunning = false;
+            }
+        });
+    </script>
+</body>
+</html>

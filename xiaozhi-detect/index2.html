@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>小智唤醒词检测系统（修复版）</title>
+
+    <!-- 配置管理 -->
+    <script>
+        const CONFIG = {
+            PATHS: {
+                TF_WASM: '/js/tfjs/tf-backend-wasm.js',
+                TF_WASM_PATH: '/js/tfjs/',
+                VAD: {
+                    MODEL: '/js/vad-web/silero_vad.onnx',
+                    WORKLET: '/js/vad-web/vad.worklet.js',
+                    WASM: '/js/vad-web/'
+                },
+                WAKE_MODEL: {
+                    JSON: '/models/xiaozhi/model.json',
+                    WEIGHTS: '/models/xiaozhi/'
+                }
+            },
+            AUDIO: {
+                SAMPLE_RATE: 16000,
+                FRAME_LENGTH: 0.025,  // 25ms
+                FRAME_STEP: 0.01      // 10ms
+            },
+            MODEL: {
+                REQUIRED_FRAMES: 30,
+                MEL_BINS: 31,
+                THRESHOLD: 0.95
+            }
+        };
+    </script>
+
+    <!-- 依赖加载 -->
+    <script src="/js/tfjs/tf.min.js"></script>
+    <script src="/js/tfjs/tf-backend-wasm.js"></script>
+    <script src="/js/vad-web/ort.min.js"></script>
+    <script src="/js/vad-web/bundle.min.js"></script>
+
+
+    <!-- 保持原有样式不变 -->
+    <style>        /* 优化后的样式 */
+        body { font-family: '微软雅黑', sans-serif; max-width: 800px; margin: 2rem auto; padding: 20px; }
+        #status { padding: 15px; border-radius: 8px; margin: 1rem 0; transition: all 0.3s; }
+        .ready { background: #4CAF50; color: white; }
+        .processing { background: #FF9800; color: white; }
+        .activated { background: #2196F3; color: white; animation: pulse 1.5s infinite; }
+        button { padding: 12px 24px; font-size: 16px; cursor: pointer; border: none; border-radius: 25px;
+                 background: #4CAF50; color: white; transition: all 0.3s; }
+        button:hover { transform: scale(1.05); box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.6; }
+            100% { opacity: 1; }
+        }
+                /* 新增动态效果样式 */
+        .voice-indicator {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            margin: 20px auto;
+            background: #e0e0e0;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+
+        .voice-active {
+            animation: pulse 1.5s infinite;
+            background: linear-gradient(45deg, #2196F3, #4CAF50);
+            box-shadow: 0 0 20px rgba(33,150,243,0.4);
+            transform: scale(1.1);
+        }
+
+        .wave-container {
+            height: 60px;
+            margin: 20px 0;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .wave-bar {
+            width: 4px;
+            height: 40px;
+            background: #4CAF50;
+            position: absolute;
+            bottom: 0;
+            transform-origin: bottom;
+            animation: wave 1.2s infinite ease-in-out;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(33,150,243,0.4); }
+            70% { box-shadow: 0 0 0 15px rgba(33,150,243,0); }
+            100% { box-shadow: 0 0 0 0 rgba(33,150,243,0); }
+        }
+
+        @keyframes wave {
+            0%, 100% { transform: scaleY(0.3); }
+            50% { transform: scaleY(1); }
+        }
+    </style>
+</head>
+<body>
+    <!-- 保持原有HTML结构不变 -->
+    <h1>小智唤醒词检测系统</h1>
+    <button id="controlBtn">启动检测</button>
+    <div id="status" class="ready">状态：准备就绪</div>
+    <div id="results"></div>
+    <div class="voice-indicator" id="voiceIndicator"></div>
+    <div class="wave-container" id="waveContainer"></div>
+    <script>
+class WakeWordEngine {
+    constructor() {
+        // 初始化状态管理
+        this.isRunning = false;
+        this.isProcessing = false;  // 新增处理锁
+        this.audioCtx = null;       // 预置音频上下文
+
+        // 元素存在性验证
+        this.assertElement('controlBtn');
+        this.assertElement('status');
+        this.assertElement('results');
+
+        // 事件绑定
+        document.getElementById('controlBtn').onclick = () => {
+            if (!this.audioCtx) {
+                this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            this.toggle();
+        };
+        //this.registerWASMFlags();
+        // 资源初始化
+        this.initialize().catch(err => this.handleError('初始化失败', err));
+        this.audioConfig = {
+            sampleRate: 16000,
+            frameLength: 512,
+            frameStep: 256,
+            nMelBins: 31,
+            fftSize: 512,
+            power: 2.0,
+            fmin: 0,
+            fmax: 8000,
+            preEmphasis: 0.97
+        };
+        // 预计算梅尔滤波器组
+        this.melFilterbank = this.createLibrosaMelFilterbank();
+
+    }
+
+    // 新增元素验证方法
+    assertElement(id) {
+        if (!document.getElementById(id)) {
+            throw new Error(`关键元素 ${id} 不存在`);
+        }
+    }
+
+    async initialize() {
+        try {
+            // 修复初始化顺序
+            await this.initTF();
+            await Promise.all([
+                this.initVAD(),
+                this.loadKerasModel()
+            ]);
+            //this.verifyDependencies();
+            this.updateStatus('系统就绪', 'ready');
+        } catch (error) {
+            this.handleError('初始化失败', error);
+        }
+    }
+<!--     verifyDependencies() {-->
+<!--        const requiredGlobals = ['tf', 'vad'];-->
+<!--        requiredGlobals.forEach(lib => {-->
+<!--            if (!window[lib]) {-->
+<!--                throw new Error(`关键依赖 ${lib} 未加载`);-->
+<!--            }-->
+<!--        });-->
+
+<!--        // 验证WASM后端类-->
+<!--        if (typeof tf.wasm?.WasmBackend === 'undefined') {-->
+<!--            throw new Error('tf-backend-wasm.js 未正确加载');-->
+<!--        }-->
+<!--    }-->
+    // 新增标志注册方法
+    registerWASMFlags() {
+        const wasmFiles = {
+            'tfjs-backend-wasm.wasm': `${CONFIG.PATHS.TF_WASM_PATH}tfjs-backend-wasm.wasm`,
+            'tfjs-backend-wasm-simd.wasm': `${CONFIG.PATHS.TF_WASM_PATH}tfjs-backend-wasm-simd.wasm`,
+            'tfjs-backend-wasm-threaded-simd.wasm': `${CONFIG.PATHS.TF_WASM_PATH}tfjs-backend-wasm-threaded-simd.wasm`
+        };
+
+        tf.env().set('WASM_PATH', wasmFiles);
+        tf.env().set('WASM_HAS_SIMD_SUPPORT', false);
+    }
+    // 修复后的WASM初始化
+    async initTF() {
+        try {
+            // 确保WASM后端存在
+            if (typeof tf.wasm === 'undefined') {
+                throw new Error('WASM后端未加载，请检查tf-backend-wasm.js是否加载');
+            }
+            const wasmDir = '/js/tfjs/';
+            tf.wasm.setWasmPaths({
+              'tfjs-backend-wasm.wasm': `${wasmDir}tfjs-backend-wasm.wasm`,
+              'tfjs-backend-wasm-simd.wasm': `${wasmDir}tfjs-backend-wasm-simd.wasm`,
+              'tfjs-backend-wasm-threaded-simd.wasm': `${wasmDir}tfjs-backend-wasm-threaded-simd.wasm`
+            });
+
+            // 原子化注册操作
+            if (!tf.engine().registry['wasm']) {
+                console.log('开始注册WASM后端...');
+
+                // 使用工厂函数确保单例
+                const backendFactory = async () => {
+                    const backend = new tf.wasm.WasmBackend();
+                    await backend.initialize();  // 关键修复点
+                    return backend;
+                };
+
+                await tf.registerBackend('wasm', backendFactory);
+                console.log('WASM后端注册完成');
+            }
+
+            // 强制设置后端
+            await tf.setBackend('wasm');
+            await tf.ready();
+            //this.registerWASMFlags();
+            // 4. 验证配置
+            console.log('WASM初始化状态:', {
+              version: tf.version_core,
+              backend: tf.getBackend(),
+              SIMD: tf.env().get('WASM_HAS_SIMD_SUPPORT')
+            });
+        } catch (error) {
+            throw new Error(`TF初始化失败: ${error.message}`);
+        }
+    }
+
+    // 修复VAD初始化
+    async initVAD() {
+        console.log('VAD初始化');
+        this.vad = await vad.MicVAD.new({
+            modelURL: CONFIG.PATHS.VAD.MODEL,
+            workletURL: CONFIG.PATHS.VAD.WORKLET,
+            minSpeechFrames: 5,
+            positiveSpeechThreshold: 0.9,
+            preSpeechPadFrames: 2,
+            redemptionFrames: 16,
+            onSpeechStart: () => {
+                 console.log("开始接收！in------");
+            },
+            onFrameProcessed: (probs) => {
+                console.log("正在说话！in------");
+                this.startVisualFeedback();
+            },
+            onSpeechEnd: async(audio) => {
+                console.log("结束说话！onSpeechEnd");
+                this.onSpeechEnd(audio);
+                this.stopVisualFeedback(); // 结束视觉反馈
+            }
+
+        });
+    }
+    async loadKerasModel() {
+        // 加载转换后的Keras模型
+        this.model = await tf.loadLayersModel('/models/xiaozhi/model.json', {
+            weightPathPrefix: '/models/xiaozhi/',
+            onProgress: (p) => console.log(`模型加载进度: ${(p*100).toFixed(1)}%`)
+        });
+        // 预热模型
+        const dummyInput = tf.zeros([1, CONFIG.MODEL.REQUIRED_FRAMES, CONFIG.MODEL.MEL_BINS, 1]);
+        this.model.predict(dummyInput).dispose();
+    }
+        // 语音开始时的动态效果
+    startVisualFeedback() {
+        this.isSpeaking = true;
+
+        // 1. 指示器动画
+        const indicator = document.getElementById('voiceIndicator');
+        indicator.classList.add('voice-active');
+
+        // 2. 创建波形动画
+        this.createWaveBars();
+
+        // 3. 动态振幅动画
+        const animate = () => {
+            if (!this.isSpeaking) return;
+
+            // 随机生成波动效果（实际应连接音频分析数据）
+            const bars = document.querySelectorAll('.wave-bar');
+            bars.forEach(bar => {
+                const scale = 0.3 + Math.random() * 0.7;
+                bar.style.transform = `scaleY(${scale})`;
+            });
+
+            this.animationFrame = requestAnimationFrame(animate);
+        };
+        animate();
+    }
+
+    // 创建波形条
+    createWaveBars() {
+        const container = document.getElementById('waveContainer');
+        container.innerHTML = '';
+
+        for (let i = 0; i < 30; i++) {
+            const bar = document.createElement('div');
+            bar.className = 'wave-bar';
+            bar.style.left = `${i * 8}px`;
+            bar.style.animationDelay = `${i * 0.05}s`;
+            container.appendChild(bar);
+        }
+    }
+
+    // 语音结束时的清理
+    stopVisualFeedback() {
+        this.isSpeaking = false;
+
+        // 1. 清除指示器状态
+        const indicator = document.getElementById('voiceIndicator');
+        indicator.classList.remove('voice-active');
+
+        // 2. 停止动画
+        if (this.animationFrame) {
+            cancelAnimationFrame(this.animationFrame);
+        }
+
+        // 3. 重置波形条
+        document.querySelectorAll('.wave-bar').forEach(bar => {
+            bar.style.transform = 'scaleY(0.3)';
+        });
+    }
+
+    // 修复竞态条件
+    async onSpeechEnd(rawAudio) {
+        console.log('收到音频数据长度:', rawAudio.length);
+        // 新增长度校验
+        const minRequired = this.audioConfig.frameLength + this.audioConfig.frameStep;
+        if (rawAudio.length < minRequired) {
+            console.warn(`音频过短: ${rawAudio.length} samples (需至少${minRequired})`);
+            return;
+        }
+
+        if (this.isProcessing) return;
+        this.isProcessing = true;
+
+        try {
+            this.updateStatus('分析中...', 'processing');
+
+            // 执行音频处理
+            const inputTensor = await this.processAudio(rawAudio);
+            console.assert(
+                inputTensor.shape[1] === 30 && inputTensor.shape[2] === 31,
+                `输入形状异常: ${inputTensor.shape}`
+            );
+
+            // 模型推理
+            const prediction = this.model.predict(inputTensor);
+            const score = (await prediction.data())[0];
+            console.log('模型得分:', score.toFixed(4));
+
+            // 结果处理
+            if (score > CONFIG.MODEL.THRESHOLD) {
+                this.onActivation();
+            } else {
+                this.updateStatus('未检测到唤醒词', 'ready');
+            }
+        } catch (error) {
+            this.handleError('分析失败', error);
+        } finally {
+            // 内存清理
+            tf.disposeVariables();
+            this.isProcessing = false;
+        }
+    }
+
+    async processAudio(rawAudio) {
+        return tf.tidy(() => {
+            // 1. 转换为Tensor并预处理
+            const audioTensor = this.preprocessAudio(rawAudio);
+
+            // 2. 生成梅尔频谱图
+            const spectrogram = this.computeMelSpectrogram(audioTensor);
+
+            // 3. 形状调整为 [batch, frames, bins, channels]
+            return spectrogram.reshape([1, ...spectrogram.shape, 1]);
+        });
+    }
+    preprocessAudio(rawAudio) {
+        return tf.tidy(() => {
+            // 1. 转换为Tensor并调整长度
+            const audioTensor = tf.tensor1d(rawAudio, 'float32');
+
+            // 确保长度为偶数（避免奇偶问题）
+            const targetLength = rawAudio.length % 2 === 0 ? rawAudio.length : rawAudio.length - 1;
+            const trimmed = audioTensor.slice(0, targetLength);
+
+            // 2. 预加重滤波（严格对齐长度）
+            const preEmphasized = tf.concat([
+                trimmed.slice(0, 1), // 第一个样本保持不变
+                tf.sub(
+                    trimmed.slice(1, trimmed.size - 1), // 确保长度为N-1
+                    trimmed.slice(0, trimmed.size - 1).mul(this.audioConfig.preEmphasis)
+                )
+            ], 0);
+
+            // 3. 标准化处理
+            return tf.div(preEmphasized, 32768.0);
+        });
+    }
+
+    computeMelSpectrogram(audioTensor) {
+        return tf.tidy(() => {
+            // 计算有效分帧长度
+            const requiredLength = this.calculateValidLength(audioTensor.size);
+            const validAudio = audioTensor.slice(0, requiredLength);
+
+            // 分帧处理
+            const frames = tf.signal.frame(
+                validAudio,
+                this.audioConfig.frameLength,
+                this.audioConfig.frameStep
+            );
+
+
+            // 加汉宁窗 (与librosa一致)
+            const window = tf.signal.hannWindow(this.audioConfig.frameLength);
+            const windowed = frames.mul(window);
+
+            // 短时傅里叶变换
+            const stft = tf.signal.stft(
+                windowed,
+                this.audioConfig.frameLength,
+                this.audioConfig.frameStep,
+                this.audioConfig.fftSize,
+                'hann'
+            );
+
+            // 计算功率谱 (power=2.0)
+            const powerSpectrum = tf.abs(stft).square();
+
+            // 应用梅尔滤波器组
+            const melSpectrogram = tf.matMul(
+                this.melFilterbank,
+                powerSpectrum.transpose([1, 0])
+            );
+
+            // 对数压缩 (对应librosa.power_to_db)
+            const logMel = tf.log(melSpectrogram.add(1e-10));
+
+            // 转置为 [frames, melBins]
+            return logMel.transpose();
+        });
+    }
+    // 新增长度计算逻辑
+    calculateValidLength(audioLength) {
+        const { frameLength, frameStep } = this.audioConfig;
+        const numFrames = Math.floor((audioLength - frameLength) / frameStep) + 1;
+        return (numFrames - 1) * frameStep + frameLength;
+    }
+    createLibrosaMelFilterbank() {
+        return tf.tidy(() => {
+            // 生成与librosa完全一致的梅尔频率刻度
+            const fftFreqs = tf.linspace(0, this.audioConfig.sampleRate/2,
+                Math.floor(this.audioConfig.fftSize/2) + 1);
+
+            const melFreqs = this.librosaMelFreqs(
+                this.audioConfig.nMelBins + 2,
+                this.audioConfig.fmin,
+                this.audioConfig.fmax
+            );
+
+            // 计算滤波器权重
+            const weights = tf.buffer([this.audioConfig.nMelBins, fftFreqs.size]);
+            const fftData = fftFreqs.arraySync();
+
+            for (let i = 0; i < this.audioConfig.nMelBins; i++) {
+                const left = melFreqs[i];
+                const center = melFreqs[i+1];
+                const right = melFreqs[i+2];
+
+                for (let j = 0; j < fftData.length; j++) {
+                    if (fftData[j] >= left && fftData[j] <= center) {
+                        const weight = (fftData[j] - left) / (center - left);
+                        weights.set(weight, i, j);
+                    } else if (fftData[j] > center && fftData[j] <= right) {
+                        const weight = (right - fftData[j]) / (right - center);
+                        weights.set(weight, i, j);
+                    }
+                }
+            }
+
+            return weights.toTensor();
+        });
+    }
+
+    librosaMelFreqs(nMels, fmin, fmax) {
+        const minLogHz = 1000.0;
+        const minLogVal = fmin / minLogHz;
+        const logstep = Math.log(6.4) / 27.0;
+
+        const freqs = [];
+        for (let i = 0; i < nMels; i++) {
+            let freq = fmin + (fmax - fmin) * (i / (nMels-1));
+            if (freq >= minLogHz) {
+                freq = minLogHz * Math.exp(minLogVal + logstep * (i - nMels/2));
+            }
+            freqs.push(freq);
+        }
+        return freqs;
+    }
+
+    async start() {
+        try {
+            if (this.vad) {
+                await this.vad.start();
+            }else{
+                this.initVAD();
+            }
+            this.isRunning = true;
+            document.getElementById('controlBtn').textContent = '停止检测';
+            this.updateStatus('检测中...', 'ready');
+        } catch (error) {
+            this.handleError('启动失败', error);
+        }
+    }
+    // 修复资源释放
+    stop() {
+        try {
+            if (this.vad) {
+                this.vad.destroy();
+                this.vad = null;
+            }
+            if (this.audioCtx) {
+                this.audioCtx.close();
+                this.audioCtx = null;
+            }
+            tf.disposeVariables();
+            this.isRunning = false;
+            this.updateStatus('已停止...', 'stop');
+            document.getElementById('controlBtn').textContent = '启动检测';
+        } catch (e) {
+            console.warn('资源释放异常:', e);
+        }
+        this.isRunning = false;
+        this.updateStatus('已停止', 'inactive');
+        this.stopVisualFeedback(); // 结束视觉反馈
+
+    }
+
+    // 保持其他方法不变
+    onActivation() {
+        this.updateStatus('唤醒成功!', 'activated');
+        this.playFeedbackTone();
+        this.logResult('✅ 检测到唤醒词「小智」');
+
+        // 3秒后恢复监听
+        setTimeout(() => this.updateStatus('恢复监听', 'ready'), 3000);
+    }
+
+    // 辅助方法
+    updateStatus(text, state) {
+        const statusDiv = document.getElementById('status');
+        statusDiv.textContent = `状态：${text}`;
+        statusDiv.className = state;
+    }
+
+    logResult(text) {
+        const resultsDiv = document.getElementById('results');
+        resultsDiv.innerHTML = `<p>${new Date().toLocaleTimeString()}: ${text}</p>${resultsDiv.innerHTML}`;
+    }
+
+    playFeedbackTone() {
+        const ctx = new AudioContext();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        osc.type = 'sine';
+        osc.frequency.value = 1000;
+        gain.gain.value = 0.3;
+
+        osc.start();
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+        osc.stop(ctx.currentTime + 0.5);
+    }
+
+    handleError(context, error) {
+        console.error('完整错误上下文:', {error,asmBackendExists: !!tf?.wasm?.WasmBackend});
+        this.updateStatus(`${error.message}`, 'error');
+        this.stop();
+    }
+
+
+    toggle() {
+        this.isRunning ? this.stop() : this.start();
+    }
+}
+
+// 初始化系统
+const engine = new WakeWordEngine();
+    </script>
+</body>
+</html>

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>小智唤醒词检测</title>
+    <!-- 加载必要的TensorFlow库 -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.18.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@3.18.0/dist/tf-backend-wasm.js"></script>
+
+    <!-- 使用经过验证的VAD库 -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/bundle.min.js"></script>
+
+
+</head>
+<body>
+    <button id="startBtn">启动麦克风</button>
+    <div id="status">状态: 未启动</div>
+    <script>
+    class WakeWordDetector {
+        constructor() {
+            this.isListening = false;
+            this.audioContext = null;
+            this.vad = null;
+
+            // 初始化按钮事件
+            document.getElementById('startBtn').onclick = () => this.toggleMic();
+        }
+
+        async initVAD() {
+            // 初始化WebAssembly后端
+            await tf.setBackend('wasm');
+            await tf.ready();
+
+            // 配置VAD参数（针对中文优化）
+            this.vad = await vad.MicVAD.new({
+                onSpeechStart: () => this.onSpeechDetected(),
+                positiveSpeechThreshold: 0.85,  // 提高中文检测灵敏度
+                negativeSpeechThreshold: 0.4,
+                minSpeechFrames: 8,            // 适合中文发音长度
+                preSpeechPadFrames: 5
+            });
+        }
+
+        toggleMic() {
+            if (!this.isListening) {
+                this.startListening();
+            } else {
+                this.stopListening();
+            }
+        }
+
+        async startListening() {
+            try {
+                await this.initVAD();
+                this.vad.start();
+                this.updateStatus('监听中...', '#4CAF50');
+                this.isListening = true;
+            } catch (error) {
+                console.error('启动失败:', error);
+                this.updateStatus(`错误: ${error.message}`, '#f44336');
+            }
+        }
+
+        stopListening() {
+            if (this.vad) {
+                this.vad.destroy();
+            }
+            this.isListening = false;
+            this.updateStatus('已停止', '#9E9E9E');
+        }
+
+        onSpeechDetected() {
+            this.updateStatus('检测到语音!', '#FFC107');
+            // 此处添加唤醒词检测逻辑
+        }
+
+        updateStatus(text, color = '#000') {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = `状态: ${text}`;
+            statusDiv.style.color = color;
+        }
+    }
+
+    // 初始化检测器
+    const detector = new WakeWordDetector();
+    </script>
+</body>
+</html>
